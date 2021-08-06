@@ -1,4 +1,4 @@
-{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE PatternSynonyms, DerivingVia #-}
 module Network.Flink.Internal.Stateful
   ( StatefulFunc
       ( insideCtx,
@@ -10,22 +10,23 @@ module Network.Flink.Internal.Stateful
         sendEgressMsg
       ),
     flinkWrapper,
+    flinkWrapper',
     createApp,
     flinkServer,
     flinkApi,
     Address(.., Address'),
     FuncType (..),
     Function (..),
-    Serde (..),
     FunctionState (..),
+    FuncId,
+    FuncExec,
     FlinkError (..),
     FunctionTable,
     Env (..),
     Expiration(..),
     ExpirationMode(..),
+    FlinkApi,
     newState,
-    ProtoSerde (..),
-    JsonSerde (..),
     jsonState,
     protoState,
     sendProtoMsg,
@@ -36,16 +37,13 @@ where
 import Control.Monad.Except
 import Control.Monad.Reader
 import Control.Monad.State (MonadState, StateT (..), gets, modify)
-import Data.Aeson (FromJSON, ToJSON, eitherDecode, encode)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as BSL
 import Data.Either.Combinators (mapLeft)
 import Data.Foldable (Foldable (toList))
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.ProtoLens (Message, defMessage, encodeMessage, messageName)
+import Data.ProtoLens (Message, defMessage)
 import Data.ProtoLens.Any (UnpackError)
-import Data.ProtoLens.Encoding (decodeMessage)
 import Data.ProtoLens.Prism
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
@@ -60,11 +58,19 @@ import Proto.RequestReply (FromFunction, ToFunction)
 import qualified Proto.RequestReply as PR
 import qualified Proto.RequestReply_Fields as PR
 import Servant
-
+import Network.Flink.Internal.Serde
 import Data.Time.Clock ( NominalDiffTime )
+import qualified Data.Text as T
+import Control.Monad.Except.CoHas (CoHas(..))
+import Deriving.Aeson
 
-data FuncType = FuncType Text Text deriving (Eq, Ord)
-data Address = Address FuncType Text
+type FuncId = Text
+data FuncType = FuncType Text Text 
+  deriving (Eq, Ord, Show, Generic)
+  deriving (ToJSON, FromJSON) via CustomJSON '[FieldLabelModifier '[CamelToSnake]] FuncType
+data Address = Address FuncType FuncId 
+  deriving (Eq, Show, Generic)
+  deriving (ToJSON, FromJSON) via CustomJSON '[FieldLabelModifier '[CamelToSnake]] Address
 
 {-# COMPLETE Address' #-}
 pattern Address' :: Text -> Text -> Text -> Address
@@ -76,10 +82,7 @@ type FuncExec = Env -> PR.ToFunction'InvocationBatchRequest -> IO (Either FlinkE
 type FunctionTable = Map FuncType FuncExec
 
 data Env = Env
-  { envFunctionNamespace :: Text,
-    envFunctionType :: Text,
-    envFunctionId :: Text
-  }
+  { eself :: Address, ecaller :: Maybe Address}
   deriving (Show)
 
 data FunctionState ctx = FunctionState
@@ -106,50 +109,6 @@ data Expiration = Expiration {
 newtype Function s a = Function {runFunction :: ExceptT FlinkError (StateT (FunctionState s) (ReaderT Env IO)) a}
   deriving (Monad, Applicative, Functor, MonadState (FunctionState s), MonadError FlinkError, MonadIO, MonadReader Env)
 
-class Serde a where
-  -- | Type name
-  tpName :: Proxy a -> Text
-
-  -- | decodes types from strict 'ByteString's
-  deserializeBytes :: ByteString -> Either String a
-
-  -- | encodes types to strict 'ByteString's
-  serializeBytes :: a -> ByteString
-
-newtype ProtoSerde a = ProtoSerde {getProto :: a}
-  deriving (Functor)
-
-instance Message a => Serde (ProtoSerde a) where
-  tpName px = "type.googleapis.com/" <> messageName (unliftP px)
-    where unliftP :: Proxy (f a) -> Proxy a
-          unliftP Proxy = Proxy
-  deserializeBytes a = ProtoSerde <$> decodeMessage a
-  serializeBytes (ProtoSerde a) = encodeMessage a
-
-type Json a = (FromJSON a, ToJSON a)
-
-newtype JsonSerde a = JsonSerde {getJson :: a}
-  deriving (Functor)
-
-instance Json a => Serde (JsonSerde a) where
-  tpName _ = "json/json" -- TODO: add adt name
-  deserializeBytes a = JsonSerde <$> eitherDecode (BSL.fromStrict a)
-  serializeBytes (JsonSerde a) = BSL.toStrict $ encode a
-
-instance Serde () where
-  tpName _ = "ghc/Unit"
-  deserializeBytes _ = pure ()
-  serializeBytes _ = ""
-
-instance Serde ByteString where
-  tpName _ = "ghc/Data.ByteString"
-  deserializeBytes = pure
-  serializeBytes = id
-
-instance Serde BSL.ByteString where
-  tpName _ = "ghc/Data.ByteString.Lazy"
-  deserializeBytes = pure . BSL.fromStrict
-  serializeBytes = BSL.toStrict
 
 -- | Used to represent all Flink stateful function capabilities.
 --
@@ -272,13 +231,14 @@ sendProtoMsgDelay addr delay = sendMsgDelay addr delay . ProtoSerde
 data FlinkError
   = MissingInvocationBatch
   | ProtodeserializeBytesError String
-  | InvalidTypePassedError Text Text
   | EmptyArgumentPassed
   | StateDecodeError String
-  | MessageDecodeError String
   | ProtoMessageDecodeError UnpackError
   | NoSuchFunction (Text, Text)
-  deriving (Show, Eq)
+  | SerErr SerdeError
+  deriving (Show, Eq, Generic)
+
+instance CoHas SerdeError FlinkError
 
 -- | Convenience function for wrapping state in newtype for JSON serialization
 jsonState :: Json s => Function s () -> Function (JsonSerde s) ()
@@ -288,21 +248,14 @@ jsonState = coerce
 protoState :: Message s => Function s () -> Function (ProtoSerde s) ()
 protoState = coerce
 
--- | Tries to unwrap typed value, possibly throwing FlinkError on broken input
-unwrapA :: forall a m. (Serde a, MonadError FlinkError m) => PR.TypedValue -> m (Maybe a)
-unwrapA arg = let
-      atp = arg ^. PR.typename
-      ctp = tpName @a Proxy
-      in if not (arg^. PR.hasValue) then pure Nothing else
-           if atp /= ctp
-              then throwError (InvalidTypePassedError ctp atp)
-              else Just <$> (liftEither . mapLeft MessageDecodeError $ deserializeBytes @a (arg ^. PR.value))
 
+flinkWrapper :: forall a s. (Serde a, Serde s) => s -> Expiration -> (a -> Function s ()) -> FuncExec
+flinkWrapper = flinkWrapper' MZ
 -- | Takes a function taking an arbitrary state type and converts it to take 'ByteString's.
 -- This allows each function in the 'FunctionTable' to take its own individual type of state and just expose
 -- a function accepting 'ByteString' to the library code.
-flinkWrapper :: forall a s. (Serde a, Serde s) => s -> Expiration -> (a -> Function s ()) -> FuncExec
-flinkWrapper s0 expr func env invocationBatch = runExceptT $ do
+flinkWrapper' :: forall as a s. (Serde a, Serde s) => Mappers as a -> s -> Expiration -> (a -> Function s ()) -> FuncExec
+flinkWrapper' mpps s0 expr func env invocationBatch = runExceptT $ do
   (eiRes, _) <- liftIO $ runner (newState s0)
   liftEither eiRes
   where
@@ -313,11 +266,11 @@ flinkWrapper s0 expr func env invocationBatch = runExceptT $ do
       case mbInitCtx of 
         Nothing -> return $ IncompleteContext expr (tpName @s Proxy) -- if state was not propagated to the function - shorcut to incomplete context reponse
         Just tv -> do 
-          mbCtx <- unwrapA @s tv
+          mbCtx <- unwrapA' @s tv
           case mbCtx of
             Nothing -> pure () -- if null state value was propagated
             Just s1 -> setInitialCtx s1
-          mbArgs <- traverse (unwrapA @a) passedArgs
+          mbArgs <- traverse (unwrapA @a mpps) passedArgs
           args <- traverse (maybe (throwError EmptyArgumentPassed) pure) mbArgs
           mapM_ func args
           gets (UpdatedState . fmap outS)
@@ -374,7 +327,7 @@ flinkServer :: FunctionTable -> Server FlinkApi
 flinkServer functions toFunction = do
   batch <- getBatch toFunction
   (function, (namespace, type', id')) <- findFunc (batch ^. PR.target)
-  result <- liftIO $ function (Env namespace type' id') batch
+  result <- liftIO $ function (Env (Address' namespace type' id') Nothing) batch
   finalState <- liftEither $ mapLeft flinkErrToServant result
   return $ createFlinkResp finalState
   where
@@ -390,8 +343,9 @@ flinkErrToServant err = case err of
   MissingInvocationBatch -> err400 {errBody = "Invocation batch missing"}
   ProtodeserializeBytesError protoErr -> err400 {errBody = "Could not deserializeBytes protobuf " <> BSL.pack protoErr}
   StateDecodeError decodeErr -> err400 {errBody = "Invalid JSON " <> BSL.pack decodeErr}
-  MessageDecodeError msg -> err400 {errBody = "Failed to decode message " <> BSL.pack msg}
+  (SerErr (MessageDecodeError msg)) -> err400 {errBody = "Failed to decode message " <> BSL.pack msg}
   ProtoMessageDecodeError msg -> err400 {errBody = "Failed to decode message " <> BSL.pack (show msg)}
   NoSuchFunction (namespace, type') -> err400 {errBody = "No such function " <> T.encodeUtf8 (fromStrict namespace) <> T.encodeUtf8 (fromStrict type')}
-  InvalidTypePassedError expected passed -> err400 {errBody = "Expected type " <> T.encodeUtf8 (fromStrict expected) <> ", got " <>  T.encodeUtf8 (fromStrict passed)}
+  (SerErr (InvalidTypePassedError expected passed)) -> 
+    err400 {errBody = "Expected type " <> T.encodeUtf8 (fromStrict ("[" <> T.intercalate ", " expected <> "]")) <> ", got " <>  T.encodeUtf8 (fromStrict passed)}
   EmptyArgumentPassed -> err400 {errBody = "Empty argument was passed to the function" }

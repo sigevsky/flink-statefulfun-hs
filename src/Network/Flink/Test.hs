@@ -8,7 +8,8 @@ import Control.Monad.State (StateT (..))
 import Data.Either.Combinators (fromRight')
 import Data.Functor (($>))
 import Network.Flink.Internal.Stateful
-  ( Env (Env),
+  ( Address(..),
+    Env (Env),
     Function (runFunction),
     FunctionState,
     newState,
@@ -32,7 +33,7 @@ testStatefulFunc ::
   IO (FunctionState s)
 testStatefulFunc initialCtx func input = runner (newState initialCtx)
   where
-    env = Env "test_namespace" "test_function" "placeholder_id"
+    env = Env (Address' "test_namespace" "test_function" "placeholder_id") Nothing
     runner state = do
       (res, state') <- runReaderT (runStateT (runExceptT $ runFunction (func input)) state) env
       return $ fromRight' (res $> state')
